@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Poor Man's DAGitty</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: #f5f7fb;
+      color: #222;
+    }
+
+    .container {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 16px;
+      padding: 16px;
+      min-height: 100vh;
+      box-sizing: border-box;
+    }
+
+    .panel {
+      background: white;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    }
+
+    h1, h2, h3 {
+      margin-top: 0;
+    }
+
+    textarea {
+      width: 100%;
+      height: 180px;
+      box-sizing: border-box;
+      font-family: Consolas, monospace;
+      font-size: 14px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      resize: vertical;
+    }
+
+    select, button {
+      width: 100%;
+      padding: 10px;
+      margin-top: 8px;
+      margin-bottom: 8px;
+      border-radius: 8px;
+      border: 1px solid #bbb;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+
+    button {
+      background: #2d6cdf;
+      color: white;
+      border: none;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    button:hover {
+      background: #1f56b7;
+    }
+
+    .small {
+      font-size: 13px;
+      color: #555;
+    }
+
+    .output {
+      white-space: pre-wrap;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      background: #f8f9fc;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 180px;
+    }
+
+    svg {
+      width: 100%;
+      height: 700px;
+      background: #fcfcff;
+      border-radius: 12px;
+      border: 1px solid #ddd;
+    }
+
+    .node {
+      cursor: default;
+    }
+
+    .node-circle {
+      fill: #ffffff;
+      stroke: #333;
+      stroke-width: 2;
+    }
+
+    .node.exposure .node-circle {
+      fill: #dfe96a;
+    }
+
+    .node.outcome .node-circle {
+      fill: #67c7f0;
+    }
+
+    .node.adjusted .node-circle {
+      stroke: #000;
+      stroke-width: 3;
+    }
+
+    .node-label {
+      text-anchor: middle;
+      dominant-baseline: middle;
+      font-size: 16px;
+      font-weight: bold;
+      user-select: none;
+    }
+
+    .edge {
+      stroke: #444;
+      stroke-width: 2.2;
+      fill: none;
+    }
+
+    .edge.causal {
+      stroke: #36a852;
+      stroke-width: 3;
+    }
+
+    .edge.backdoor-open {
+      stroke: #d93025;
+      stroke-width: 3;
+    }
+
+    .legend {
+      margin-top: 12px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      vertical-align: middle;
+      margin-right: 6px;
+      border: 1px solid #555;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="panel">
+      <h1>Poor Man's DAGitty</h1>
+      <p class="small">
+        Enter one directed edge per line using the format:
+        <br><code>A -> B</code>
+      </p>
+
+      <textarea id="graphInput">A -> E
+A -> Z
+B -> D
+B -> Z
+E -> D</textarea>
+
+      <button id="loadGraphBtn">Load Graph</button>
+
+      <label for="exposureSelect"><strong>Exposure</strong></label>
+      <select id="exposureSelect"></select>
+
+      <label for="outcomeSelect"><strong>Outcome</strong></label>
+      <select id="outcomeSelect"></select>
+
+      <button id="analyzeBtn">Analyze Adjustment Sets</button>
+
+      <div class="legend">
+        <div><span class="swatch" style="background:#dfe96a;"></span> Exposure</div>
+        <div><span class="swatch" style="background:#67c7f0;"></span> Outcome</div>
+        <div><span class="swatch" style="background:white; border:3px solid #000;"></span> In chosen adjustment set</div>
+        <div><span class="swatch" style="background:#36a852;"></span> Causal path edge</div>
+        <div><span class="swatch" style="background:#d93025;"></span> Open back-door path edge</div>
+      </div>
+
+      <h3>Results</h3>
+      <div id="results" class="output"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Graph</h2>
+      <svg id="graphSvg" viewBox="0 0 1000 700"></svg>
+    </div>
+  </div>
+
+  <script>
+    let graph = {
+      nodes: [],
+      edges: []
+    };
+
+    let analysisState = {
+      exposure: null,
+      outcome: null,
+      oneValidSet: [],
+      minimalSets: [],
+      openBackdoorPaths: [],
+      allBackdoorPaths: [],
+      causalPaths: []
+    };
+
+    function parseGraph(inputText) {
+      const edges = [];
+      const nodeSet = new Set();
+
+      const lines = inputText
+        .split("\n")
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+
+      for (const line of lines) {
+        const match = line.match(/^([A-Za-z0-9_]+)\s*->\s*([A-Za-z0-9_]+)$/);
+        if (!match) {
+          throw new Error(`Invalid line: "${line}". Use format like A -> B`);
+        }
+        const from = match[1];
+        const to = match[2];
+        edges.push({ from, to });
+        nodeSet.add(from);
+        nodeSet.add(to);
+      }
+
+      return {
+        nodes: Array.from(nodeSet).sort(),
+        edges
+      };
+    }
+
+    function populateSelectors(nodes) {
+      const exposureSelect = document.getElementById("exposureSelect");
+      const outcomeSelect = document.getElementById("outcomeSelect");
+
+      exposureSelect.innerHTML = "";
+      outcomeSelect.innerHTML = "";
+
+      for (const node of nodes) {
+        const opt1 = document.createElement("option");
+        opt1.value = node;
+        opt1.textContent = node;
+        exposureSelect.appendChild(opt1);
+
+        const opt2 = document.createElement("option");
+        opt2.value = node;
+        opt2.textContent = node;
+        outcomeSelect.appendChild(opt2);
+      }
+
+      if (nodes.includes("E")) exposureSelect.value = "E";
+      if (nodes.includes("D")) outcomeSelect.value = "D";
+
+      if (exposureSelect.value === outcomeSelect.value && nodes.length > 1) {
+        outcomeSelect.value = nodes.find(n => n !== exposureSelect.value);
+      }
+    }
+
+    function getChildrenMap(nodes, edges) {
+      const map = {};
+      for (const n of nodes) map[n] = [];
+      for (const e of edges) map[e.from].push(e.to);
+      return map;
+    }
+
+    function getParentsMap(nodes, edges) {
+      const map = {};
+      for (const n of nodes) map[n] = [];
+      for (const e of edges) map[e.to].push(e.from);
+      return map;
+    }
+
+    function getUndirectedAdj(nodes, edges) {
+      const adj = {};
+      for (const n of nodes) adj[n] = new Set();
+      for (const e of edges) {
+        adj[e.from].add(e.to);
+        adj[e.to].add(e.from);
+      }
+      return adj;
+    }
+
+    function hasDirectedEdge(from, to, edges) {
+      return edges.some(e => e.from === from && e.to === to);
+    }
+
+    function getDescendants(start, childrenMap) {
+      const visited = new Set();
+      const stack = [...childrenMap[start]];
+
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (visited.has(current)) continue;
+        visited.add(current);
+        for (const child of childrenMap[current]) {
+          stack.push(child);
+        }
+      }
+
+      return visited;
+    }
+
+    function getAllDescendantsMap(nodes, childrenMap) {
+      const map = {};
+      for (const n of nodes) {
+        map[n] = getDescendants(n, childrenMap);
+      }
+      return map;
+    }
+
+    function findAllSimplePaths(start, end, undirectedAdj) {
+      const paths = [];
+      const visited = new Set();
+
+      function dfs(current, path) {
+        if (current === end) {
+          paths.push([...path]);
+          return;
+        }
+
+        for (const neighbor of undirectedAdj[current]) {
+          if (!visited.has(neighbor)) {
+            visited.add(neighbor);
+            path.push(neighbor);
+            dfs(neighbor, path);
+            path.pop();
+            visited.delete(neighbor);
+          }
+        }
+      }
+
+      visited.add(start);
+      dfs(start, [start]);
+      return paths;
+    }
+
+    function isCollider(prev, curr, next, edges) {
+      return hasDirectedEdge(prev, curr, edges) && hasDirectedEdge(next, curr, edges);
+    }
+
+    function isPathBackdoor(path, exposure, edges) {
+      if (path.length < 2) return false;
+      const firstNeighbor = path[1];
+      return hasDirectedEdge(firstNeighbor, exposure, edges);
+    }
+
+    function isPathFullyDirectedFromExposure(path, edges) {
+      for (let i = 0; i < path.length - 1; i++) {
+        if (!hasDirectedEdge(path[i], path[i + 1], edges)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function hasDescendantInSet(node, setS, allDescendantsMap) {
+      for (const d of allDescendantsMap[node]) {
+        if (setS.has(d)) return true;
+      }
+      return false;
+    }
+
+    function isPathActiveGivenSet(path, setS, edges, allDescendantsMap) {
+      if (path.length <= 2) return true;
+
+      for (let i = 1; i < path.length - 1; i++) {
+        const prev = path[i - 1];
+        const curr = path[i];
+        const next = path[i + 1];
+
+        const collider = isCollider(prev, curr, next, edges);
+
+        if (collider) {
+          const colliderOpen = setS.has(curr) || hasDescendantInSet(curr, setS, allDescendantsMap);
+          if (!colliderOpen) return false;
+        } else {
+          if (setS.has(curr)) return false;
+        }
+      }
+
+      return true;
+    }
+
+    function powerSet(arr) {
+      const result = [[]];
+      for (const item of arr) {
+        const currentLength = result.length;
+        for (let i = 0; i < currentLength; i++) {
+          result.push([...result[i], item]);
+        }
+      }
+      return result;
+    }
+
+    function isValidAdjustmentSet(candidateSet, exposure, outcome, nodes, edges, childrenMap, allDescendantsMap) {
+      const setS = new Set(candidateSet);
+
+      const exposureDescendants = allDescendantsMap[exposure];
+      for (const node of candidateSet) {
+        if (exposureDescendants.has(node)) {
+          return false;
+        }
+      }
+
+      const undirectedAdj = getUndirectedAdj(nodes, edges);
+      const allPaths = findAllSimplePaths(exposure, outcome, undirectedAdj);
+      const backdoorPaths = allPaths.filter(path => isPathBackdoor(path, exposure, edges));
+
+      for (const path of backdoorPaths) {
+        if (isPathActiveGivenSet(path, setS, edges, allDescendantsMap)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    function findAdjustmentSets(nodes, edges, exposure, outcome) {
+      const childrenMap = getChildrenMap(nodes, edges);
+      const allDescendantsMap = getAllDescendantsMap(nodes, childrenMap);
+      const undirectedAdj = getUndirectedAdj(nodes, edges);
+      const allPaths = findAllSimplePaths(exposure, outcome, undirectedAdj);
+
+      const backdoorPaths = allPaths.filter(path => isPathBackdoor(path, exposure, edges));
+      const causalPaths = allPaths.filter(path => isPathFullyDirectedFromExposure(path, edges));
+
+      const candidates = nodes.filter(n =>
+        n !== exposure &&
+        n !== outcome &&
+        !allDescendantsMap[exposure].has(n)
+      );
+
+      const allSets = powerSet(candidates);
+      const validSets = allSets.filter(set =>
+        isValidAdjustmentSet(set, exposure, outcome, nodes, edges, childrenMap, allDescendantsMap)
+      );
+
+      validSets.sort((a, b) => a.length - b.length || a.join(",").localeCompare(b.join(",")));
+
+      const minimalSets = validSets.filter(set => {
+        return !validSets.some(other =>
+          other.length < set.length &&
+          other.every(x => set.includes(x))
+        );
+      });
+
+      const openBackdoorPathsForEmptySet = backdoorPaths.filter(path =>
+        isPathActiveGivenSet(path, new Set(), edges, allDescendantsMap)
+      );
+
+      return {
+        oneValidSet: minimalSets[0] || [],
+        minimalSets,
+        backdoorPaths,
+        openBackdoorPaths: openBackdoorPathsForEmptySet,
+        causalPaths
+      };
+    }
+
+    function layoutNodes(nodes) {
+      const positions = {};
+      const cx = 500;
+      const cy = 350;
+      const radius = 250;
+
+      if (nodes.length === 1) {
+        positions[nodes[0]] = { x: cx, y: cy };
+        return positions;
+      }
+
+      nodes.forEach((node, i) => {
+        const angle = (2 * Math.PI * i) / nodes.length - Math.PI / 2;
+        positions[node] = {
+          x: cx + radius * Math.cos(angle),
+          y: cy + radius * Math.sin(angle)
+        };
+      });
+
+      return positions;
+    }
+
+    function pathToEdgeSet(paths) {
+      const set = new Set();
+      for (const path of paths) {
+        for (let i = 0; i < path.length - 1; i++) {
+          const a = path[i];
+          const b = path[i + 1];
+          set.add(`${a}->${b}`);
+          set.add(`${b}->${a}`);
+        }
+      }
+      return set;
+    }
+
+    function renderGraph(graph, analysisState) {
+      const svg = document.getElementById("graphSvg");
+      svg.innerHTML = "";
+
+      const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+      marker.setAttribute("id", "arrowhead");
+      marker.setAttribute("markerWidth", "10");
+      marker.setAttribute("markerHeight", "7");
+      marker.setAttribute("refX", "9");
+      marker.setAttribute("refY", "3.5");
+      marker.setAttribute("orient", "auto");
+      marker.setAttribute("markerUnits", "strokeWidth");
+
+      const arrowPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      arrowPath.setAttribute("d", "M 0 0 L 10 3.5 L 0 7 z");
+      arrowPath.setAttribute("fill", "#444");
+
+      marker.appendChild(arrowPath);
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+
+      const positions = layoutNodes(graph.nodes);
+      const causalEdgeSet = pathToEdgeSet(analysisState.causalPaths || []);
+      const openBackdoorEdgeSet = pathToEdgeSet(analysisState.openBackdoorPaths || []);
+      const adjustedSet = new Set(analysisState.oneValidSet || []);
+
+      for (const edge of graph.edges) {
+        const from = positions[edge.from];
+        const to = positions[edge.to];
+
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        const ux = dx / len;
+        const uy = dy / len;
+
+        const nodeRadius = 26;
+        const startX = from.x + ux * nodeRadius;
+        const startY = from.y + uy * nodeRadius;
+        const endX = to.x - ux * nodeRadius;
+        const endY = to.y - uy * nodeRadius;
+
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", startX);
+        line.setAttribute("y1", startY);
+        line.setAttribute("x2", endX);
+        line.setAttribute("y2", endY);
+        line.setAttribute("class", "edge");
+        line.setAttribute("marker-end", "url(#arrowhead)");
+
+        const key = `${edge.from}->${edge.to}`;
+        if (openBackdoorEdgeSet.has(key)) {
+          line.classList.add("backdoor-open");
+        } else if (causalEdgeSet.has(key)) {
+          line.classList.add("causal");
+        }
+
+        svg.appendChild(line);
+      }
+
+      for (const node of graph.nodes) {
+        const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        group.setAttribute("class", "node");
+
+        if (node === analysisState.exposure) group.classList.add("exposure");
+        if (node === analysisState.outcome) group.classList.add("outcome");
+        if (adjustedSet.has(node)) group.classList.add("adjusted");
+
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("cx", positions[node].x);
+        circle.setAttribute("cy", positions[node].y);
+        circle.setAttribute("r", 26);
+        circle.setAttribute("class", "node-circle");
+
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("x", positions[node].x);
+        label.setAttribute("y", positions[node].y + 1);
+        label.setAttribute("class", "node-label");
+        label.textContent = node;
+
+        group.appendChild(circle);
+        group.appendChild(label);
+        svg.appendChild(group);
+      }
+    }
+
+    function formatSet(setArr) {
+      if (!setArr || setArr.length === 0) return "{}";
+      return "{ " + setArr.join(", ") + " }";
+    }
+
+    function formatPath(path) {
+      return path.join(" - ");
+    }
+
+    function updateResults(analysisState) {
+      const results = document.getElementById("results");
+
+      const lines = [];
+      lines.push(`Exposure: ${analysisState.exposure}`);
+      lines.push(`Outcome: ${analysisState.outcome}`);
+      lines.push("");
+
+      lines.push("One valid adjustment set:");
+      lines.push(formatSet(analysisState.oneValidSet));
+      lines.push("");
+
+      lines.push("All minimal valid adjustment sets:");
+      if (!analysisState.minimalSets || analysisState.minimalSets.length === 0) {
+        lines.push("None");
+      } else {
+        for (const s of analysisState.minimalSets) {
+          lines.push("  " + formatSet(s));
+        }
+      }
+
+      lines.push("");
+      lines.push("Back-door paths:");
+      if (!analysisState.allBackdoorPaths || analysisState.allBackdoorPaths.length === 0) {
+        lines.push("None");
+      } else {
+        for (const p of analysisState.allBackdoorPaths) {
+          lines.push("  " + formatPath(p));
+        }
+      }
+
+      lines.push("");
+      lines.push("Open back-door paths with no adjustment:");
+      if (!analysisState.openBackdoorPaths || analysisState.openBackdoorPaths.length === 0) {
+        lines.push("None");
+      } else {
+        for (const p of analysisState.openBackdoorPaths) {
+          lines.push("  " + formatPath(p));
+        }
+      }
+
+      lines.push("");
+      lines.push("Fully directed causal paths from exposure to outcome:");
+      if (!analysisState.causalPaths || analysisState.causalPaths.length === 0) {
+        lines.push("None");
+      } else {
+        for (const p of analysisState.causalPaths) {
+          lines.push("  " + formatPath(p));
+        }
+      }
+
+      results.textContent = lines.join("\n");
+    }
+
+    function loadGraph() {
+      try {
+        const inputText = document.getElementById("graphInput").value;
+        graph = parseGraph(inputText);
+        populateSelectors(graph.nodes);
+
+        analysisState = {
+          exposure: document.getElementById("exposureSelect").value,
+          outcome: document.getElementById("outcomeSelect").value,
+          oneValidSet: [],
+          minimalSets: [],
+          openBackdoorPaths: [],
+          allBackdoorPaths: [],
+          causalPaths: []
+        };
+
+        renderGraph(graph, analysisState);
+        updateResults({
+          exposure: analysisState.exposure,
+          outcome: analysisState.outcome,
+          oneValidSet: [],
+          minimalSets: [],
+          openBackdoorPaths: [],
+          allBackdoorPaths: [],
+          causalPaths: []
+        });
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    function analyzeGraph() {
+      try {
+        const exposure = document.getElementById("exposureSelect").value;
+        const outcome = document.getElementById("outcomeSelect").value;
+
+        if (exposure === outcome) {
+          alert("Exposure and outcome must be different.");
+          return;
+        }
+
+        const result = findAdjustmentSets(graph.nodes, graph.edges, exposure, outcome);
+
+        analysisState = {
+          exposure,
+          outcome,
+          oneValidSet: result.oneValidSet,
+          minimalSets: result.minimalSets,
+          openBackdoorPaths: result.openBackdoorPaths,
+          allBackdoorPaths: result.backdoorPaths,
+          causalPaths: result.causalPaths
+        };
+
+        renderGraph(graph, analysisState);
+        updateResults(analysisState);
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    document.getElementById("loadGraphBtn").addEventListener("click", loadGraph);
+    document.getElementById("analyzeBtn").addEventListener("click", analyzeGraph);
+
+    loadGraph();
+  </script>
+</body>
+</html>
